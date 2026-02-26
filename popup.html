@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Video Sync</title>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --neon-cyan: #0ff;
+      --neon-pink: #f0f;
+      --neon-yellow: #fcee0a;
+      --dark-bg: #090a0f;
+      --grid-line: rgba(0, 255, 255, 0.1);
+    }
+
+    body {
+      width: 220px;
+      padding: 30px 15px;
+      margin: 0;
+      background-color: var(--dark-bg);
+      background-image: 
+        linear-gradient(var(--grid-line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+      background-size: 15px 15px;
+      font-family: 'Orbitron', sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+
+    .cyber-input {
+      width: 100%;
+      box-sizing: border-box;
+      background: var(--dark-bg);
+      color: var(--neon-yellow);
+      border: 1px solid var(--neon-cyan);
+      padding: 10px;
+      margin-bottom: 15px;
+      font-family: 'Orbitron', sans-serif;
+      text-transform: uppercase;
+      outline: none;
+      box-shadow: inset 0 0 5px rgba(0, 255, 255, 0.2);
+    }
+    .cyber-input::placeholder {
+      color: rgba(0, 255, 255, 0.4);
+    }
+    .cyber-input:focus {
+      border-color: var(--neon-pink);
+      box-shadow: 0 0 10px rgba(255, 0, 255, 0.3);
+    }
+
+    /* Container to hold the button and the system tag */
+    .btn-container {
+      position: relative;
+      width: 100%;
+    }
+
+    /* Little UI detail tag */
+    .cyber-tag {
+      position: absolute;
+      top: -12px;
+      left: 10px;
+      font-size: 8px;
+      background: var(--dark-bg);
+      padding: 0 4px;
+      color: var(--neon-yellow);
+      letter-spacing: 1px;
+      border: 1px solid var(--neon-yellow);
+      z-index: 10;
+    }
+
+    .cyber-btn {
+      position: relative;
+      width: 100%;
+      padding: 12px 0;
+      background: var(--dark-bg);
+      color: var(--neon-cyan);
+      font-family: 'Orbitron', sans-serif;
+      font-size: 14px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      border: 2px solid var(--neon-cyan);
+      cursor: pointer;
+      outline: none;
+      box-shadow: 0 0 10px rgba(0, 255, 255, 0.3), 
+                  inset 0 0 10px rgba(0, 255, 255, 0.2);
+      transition: box-shadow 0.2s, border-color 0.2s;
+      clip-path: polygon(15px 0, 100% 0, 100% calc(100% - 15px), calc(100% - 15px) 100%, 0 100%, 0 15px);
+    }
+
+    /* Pseudo-elements for the glitch layers */
+    .cyber-btn::before, 
+    .cyber-btn::after {
+      content: attr(data-text);
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--dark-bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+    }
+
+    /* Left shifting pink glitch layer */
+    .cyber-btn:hover::before {
+      opacity: 1;
+      left: 3px;
+      text-shadow: -2px 0 var(--neon-pink);
+      color: var(--neon-cyan);
+      background: var(--dark-bg);
+      animation: glitch-anim-1 0.3s cubic-bezier(.25, .46, .45, .94) both infinite;
+    }
+
+    /* Right shifting cyan glitch layer */
+    .cyber-btn:hover::after {
+      opacity: 1;
+      left: -3px;
+      text-shadow: 2px 0 var(--neon-cyan);
+      color: var(--neon-pink);
+      background: var(--dark-bg);
+      animation: glitch-anim-2 0.3s cubic-bezier(.25, .46, .45, .94) both infinite backwards;
+    }
+
+    .cyber-btn:hover {
+      box-shadow: 0 0 20px var(--neon-cyan);
+    }
+
+    .cyber-btn:active {
+      transform: scale(0.96);
+      border-color: var(--neon-pink);
+      color: var(--neon-pink);
+      box-shadow: 0 0 20px var(--neon-pink);
+    }
+
+    /* Keyframes that slice the text rapidly to create the glitch */
+    @keyframes glitch-anim-1 {
+      0% { clip-path: inset(10% 0 80% 0); }
+      20% { clip-path: inset(80% 0 1% 0); }
+      40% { clip-path: inset(40% 0 40% 0); }
+      60% { clip-path: inset(15% 0 60% 0); }
+      80% { clip-path: inset(90% 0 5% 0); }
+      100% { clip-path: inset(30% 0 50% 0); }
+    }
+
+    @keyframes glitch-anim-2 {
+      0% { clip-path: inset(25% 0 50% 0); }
+      20% { clip-path: inset(60% 0 20% 0); }
+      40% { clip-path: inset(10% 0 70% 0); }
+      60% { clip-path: inset(80% 0 10% 0); }
+      80% { clip-path: inset(5% 0 80% 0); }
+      100% { clip-path: inset(50% 0 30% 0); }
+    }
+  </style>
+</head>
+<body>
+  <input type="text" id="roomInput" class="cyber-input" placeholder="ENTER ROOM ID">
+  <div class="btn-container">
+    <div class="cyber-tag">SYS.READY</div>
+    <button id="syncBtn" class="cyber-btn" data-text="Join Room">Sync Video</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

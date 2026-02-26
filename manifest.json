@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Video Controller",
+  "version": "1.0",
+  "description": "Pause video from extension",
+  "permissions": ["activeTab", "scripting"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+  {
+    "matches": ["*://*.youtube.com/*", "*://*.netflix.com/*"],
+    "js": ["socket.io.min.js", "content.js"]
+  }
+]
+}
