@@ -1,4 +1,4 @@
-const socket = io('http://localhost:3000');
+const socket = io('https://my-watch-party-backend.onrender.com');
 let ROOM_ID = ""; // Starts empty!
 let USERNAME = "Guest";
 
