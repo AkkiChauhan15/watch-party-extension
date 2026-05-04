@@ -5,7 +5,8 @@
   "description": "Pause video from extension",
   "permissions": ["activeTab", "scripting"],
   "action": {
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "permissions": ["activeTab", "scripting", "storage", "microphone"]
   },
   "content_scripts": [
   {
