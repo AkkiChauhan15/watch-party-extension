@@ -10,7 +10,15 @@
   },
   "content_scripts": [
   {
-    "matches": ["*://*.youtube.com/*", "*://*.netflix.com/*"],
+    "matches": [
+  "*://*.youtube.com/*",
+  "*://*.netflix.com/*",
+  "*://*.amazon.com/*",
+  "*://*.primevideo.com/*",
+  "*://*.disneyplus.com/*",
+  "*://*.max.com/*",
+  "*://*.hulu.com/*"
+],
     "js": ["socket.io.min.js", "content.js"]
   }
 ]
