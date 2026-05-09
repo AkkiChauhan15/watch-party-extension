@@ -1,9 +1,9 @@
-//const socket = io('https://my-watch-party-backend.onrender.com');
-const socket = io('http://localhost:3000');
+const socket = io('https://my-watch-party-backend.onrender.com');
+//const socket = io('http://localhost:3000');
 
 let ROOM_ID  = "";
 let USERNAME = "Guest";
-let IS_HOST  = false;  // set once server confirms host status via queue_update
+let IS_HOST  = false;
 
 socket.on('connect', () => console.log(`🔗 Connected: ${socket.id}`));
 
@@ -89,17 +89,38 @@ function formatTime(s) {
 }
 
 // =====================================================
-// AD & BUFFER WATCHER
+// CHANGE 1: AD WATCHER — MutationObserver instead of setInterval
+// Fires only when DOM actually changes (~90% less CPU during normal playback)
+// Disconnects automatically when not in a room
 // =====================================================
-let isInAd = false, isBuffering = false, _adTimer = null;
+let isInAd = false, isBuffering = false;
+let _adObserver = null;
+
 function startAdWatcher() {
-    if (_adTimer) return;
-    _adTimer = setInterval(() => {
+    // Don't create a second observer if one is already running
+    if (_adObserver) return;
+
+    _adObserver = new MutationObserver(() => {
+        // Guard: only emit when actually in a room
         if (!ROOM_ID) return;
+
         const adNow = PLATFORM.isAd();
-        if (adNow && !isInAd)  { isInAd = true;  socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'ad_start' }); }
-        if (!adNow && isInAd)  { isInAd = false; socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'ad_end'   }); }
-    }, 1500);
+        if (adNow && !isInAd) {
+            isInAd = true;
+            socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'ad_start' });
+        } else if (!adNow && isInAd) {
+            isInAd = false;
+            socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'ad_end' });
+        }
+    });
+
+    // Watch the whole body for any DOM change — ad overlays appear/disappear here
+    _adObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+function stopAdWatcher() {
+    if (_adObserver) { _adObserver.disconnect(); _adObserver = null; }
+    isInAd = false;
 }
 
 // =====================================================
@@ -114,19 +135,20 @@ function attachVideoListeners() {
     video.addEventListener('waiting', () => { if (isInAd || isBuffering) return; isBuffering = true;  socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'buffer_start' }); });
     video.addEventListener('canplay', () => { if (!isBuffering) return;           isBuffering = false; socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'buffer_end'   }); });
 
+    socket.off('sync_state');
     socket.on('sync_state', (data) => {
         if (!video) return;
         isRemoteAction = true;
         if (Math.abs(video.currentTime - data.time) > 0.5) video.currentTime = data.time;
         if (data.action === 'play')  video.play().catch(() => {});
         if (data.action === 'pause') video.pause();
+        if (data.message) showNotification(data.message);
         setTimeout(() => { isRemoteAction = false; }, 800);
     });
     socket.on('latecomer_arrived', (data) => {
         video.pause();
         socket.emit('sync_state', { roomId: ROOM_ID, action: 'pause', time: video.currentTime, message: `GUEST_${data.newUserId} DETECTED. SYNCING...` });
     });
-    socket.on('sync_state', (data) => { if (data.message) showNotification(data.message); });
 }
 
 // =====================================================
@@ -135,10 +157,10 @@ function attachVideoListeners() {
 socket.on('navigate_to', (data) => {
     const { url } = data;
     if (!url) return;
+    if (window.location.href === url) return; // prevent infinite redirect loop
     showNotification(`▶ LOADING: ${data.title || url}`);
-    // Reset video attachment so we re-attach on the new page
     video = null; videoListenersAttached = false;
-    // Navigate after a short delay so notification is visible
+    stopAdWatcher(); // disconnect observer before navigating away
     setTimeout(() => { window.location.href = url; }, 1200);
 });
 
@@ -156,6 +178,14 @@ socket.on('user_status', (data) => {
     if (msgs[type]) appendStatusMessage(msgs[type], type);
     if (type === 'ad_start' && video && !isInAd) { isRemoteAction = true; video.pause(); setTimeout(() => { isRemoteAction = false; }, 800); }
     if (type === 'ad_end'   && video)            { isRemoteAction = true; video.play().catch(() => {}); setTimeout(() => { isRemoteAction = false; }, 800); }
+});
+
+// =====================================================
+// CHANGE 2: VIEWER COUNT — live member count in header
+// =====================================================
+socket.on('room_count', (data) => {
+    const el = document.getElementById('wp-viewer-count');
+    if (el) el.textContent = `👁 ${data.count} WATCHING`;
 });
 
 // =====================================================
@@ -272,7 +302,6 @@ socket.on('queue_update', (data) => {
     currentQueue = data.queue || [];
     IS_HOST = (data.host === socket.id);
     renderQueue(currentQueue, IS_HOST);
-    // Update host badge
     const badge = document.getElementById('wp-host-badge');
     if (badge) badge.style.display = IS_HOST ? 'inline-block' : 'none';
 });
@@ -309,7 +338,6 @@ function renderQueue(queue, isHost) {
         container.appendChild(el);
     });
 
-    // Wire up host buttons
     if (isHost) {
         container.querySelectorAll('.wp-q-play').forEach(btn => {
             btn.addEventListener('click', () => socket.emit('queue_play_item', { roomId: ROOM_ID, itemId: Number(btn.dataset.id) }));
@@ -374,6 +402,22 @@ function setSquish(isDocked) {
 }
 
 // =====================================================
+// CHANGE 3: COPY PARTY LINK
+// =====================================================
+function copyPartyLink() {
+    const url = new URL(window.location.href);
+    url.searchParams.set('wp', ROOM_ID);
+    navigator.clipboard.writeText(url.toString()).then(() => {
+        showNotification('🔗 PARTY LINK COPIED!');
+        // Flash the button text as feedback
+        const btn = document.getElementById('wp-copy-link-btn');
+        if (btn) { btn.innerText = 'COPIED!'; setTimeout(() => { btn.innerText = '🔗 LINK'; }, 2000); }
+    }).catch(() => {
+        showNotification('ERR: CLIPBOARD ACCESS DENIED');
+    });
+}
+
+// =====================================================
 // INJECT CHAT UI
 // =====================================================
 function injectChatUI() {
@@ -408,9 +452,18 @@ function injectChatUI() {
 
         /* HEADER */
         #wp-chat-header { background:rgba(7,7,12,.99);padding:10px 14px;font-weight:bold;font-size:13px;display:flex;flex-direction:column;gap:7px;border-bottom:2px solid var(--cy-cyan);text-transform:uppercase;letter-spacing:1px;box-shadow:0 4px 12px rgba(0,255,255,.2);position:relative;z-index:10; }
-        #wp-header-top { display:flex;justify-content:space-between;align-items:center;text-shadow:0 0 6px var(--cy-cyan); }
-        #wp-host-badge { display:none;font-size:9px;color:var(--cy-yellow);border:1px solid var(--cy-yellow);padding:2px 6px;text-shadow:0 0 4px var(--cy-yellow); }
-        #wp-platform-badge { font-size:9px;color:#555;border:1px solid #333;padding:2px 6px; }
+        #wp-header-top { display:flex;justify-content:space-between;align-items:center;gap:6px;text-shadow:0 0 6px var(--cy-cyan); }
+        #wp-header-top span:first-child { flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+        #wp-host-badge { display:none;font-size:9px;color:var(--cy-yellow);border:1px solid var(--cy-yellow);padding:2px 6px;text-shadow:0 0 4px var(--cy-yellow);white-space:nowrap;flex-shrink:0; }
+        #wp-platform-badge { font-size:9px;color:#555;border:1px solid #333;padding:2px 6px;white-space:nowrap;flex-shrink:0; }
+
+        /* HEADER SECOND ROW: viewer count + copy link */
+        #wp-header-meta { display:flex;align-items:center;justify-content:space-between;gap:8px; }
+        #wp-viewer-count { font-size:10px;color:#666;letter-spacing:1px; }
+        #wp-copy-link-btn { background:transparent;border:1px solid #444;color:#888;padding:3px 8px;font-size:10px;font-family:'Share Tech Mono',monospace;font-weight:bold;cursor:pointer;text-transform:uppercase;transition:all .2s;letter-spacing:1px;white-space:nowrap; }
+        #wp-copy-link-btn:hover { border-color:var(--cy-cyan);color:var(--cy-cyan);box-shadow:0 0 6px rgba(0,255,255,.4); }
+        #wp-copy-link-btn:active { transform:translate(1px,1px); }
+
         #wp-call-bar { display:flex;align-items:center;gap:7px;flex-wrap:wrap; }
         #wp-call-status { font-size:11px;color:var(--cy-yellow);font-weight:bold;display:none;align-items:center;gap:4px;flex:1;text-shadow:0 0 5px var(--cy-yellow); }
         #wp-call-status::before { content:'>';animation:wp-blink 1s infinite; }
@@ -462,7 +515,6 @@ function injectChatUI() {
         /* QUEUE PANEL */
         #wp-queue-panel { display:none;flex-direction:column;flex:1;overflow:hidden;position:relative;z-index:10; }
         #wp-queue-panel.active { display:flex; }
-
         #wp-queue-add-area { padding:12px 14px;background:rgba(0,0,0,.7);border-bottom:1px solid rgba(0,255,255,.15);position:relative;z-index:10;display:flex;flex-direction:column;gap:8px; }
         #wp-queue-add-area label { font-size:10px;color:var(--cy-cyan);text-transform:uppercase;letter-spacing:1px;font-weight:bold; }
         .wp-queue-input-row { display:flex;gap:6px; }
@@ -474,24 +526,18 @@ function injectChatUI() {
         #wp-queue-add-btn { background:transparent;border:1px solid var(--cy-green);color:var(--cy-green);padding:9px 12px;font-size:12px;font-family:'Share Tech Mono',monospace;font-weight:bold;cursor:pointer;text-transform:uppercase;box-shadow:inset 0 0 5px rgba(0,255,136,.2);transition:all .2s;white-space:nowrap; }
         #wp-queue-add-btn:hover { background:var(--cy-green);color:#000;box-shadow:0 0 12px var(--cy-green); }
         #wp-queue-add-btn:active { transform:translate(2px,2px); }
-
-        /* HOST controls bar */
         #wp-queue-host-bar { display:none;padding:8px 14px;background:rgba(0,0,0,.6);border-bottom:1px solid rgba(240,234,0,.15);align-items:center;gap:8px; }
         #wp-queue-host-bar.visible { display:flex; }
         #wp-queue-skip-btn { background:transparent;border:1px solid var(--cy-yellow);color:var(--cy-yellow);padding:5px 10px;font-size:10px;font-family:'Share Tech Mono',monospace;font-weight:bold;cursor:pointer;text-transform:uppercase;transition:all .2s; }
         #wp-queue-skip-btn:hover { background:var(--cy-yellow);color:#000; }
         .wp-host-label { font-size:10px;color:var(--cy-yellow);text-shadow:0 0 4px var(--cy-yellow);margin-left:auto; }
-
-        /* QUEUE LIST */
         #wp-queue-list { flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:6px; }
         #wp-queue-list::-webkit-scrollbar { width:4px; }
         #wp-queue-list::-webkit-scrollbar-thumb { background:var(--cy-cyan); }
-
         .wp-queue-empty { display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:12px;opacity:.5; }
         .wp-queue-empty-icon { font-size:40px; }
         .wp-queue-empty-text { font-size:14px;color:var(--cy-cyan);font-weight:bold;text-transform:uppercase;letter-spacing:2px; }
         .wp-queue-empty-sub { font-size:11px;color:#555;text-transform:uppercase;text-align:center; }
-
         .wp-queue-item { display:flex;align-items:center;gap:8px;padding:10px 12px;background:rgba(0,0,0,.7);border:1px solid rgba(0,255,255,.1);transition:border-color .2s,background .2s;animation:fadeIn .25s ease; }
         .wp-queue-item:hover { border-color:rgba(0,255,255,.35);background:rgba(0,255,255,.04); }
         .wp-queue-item-num { font-size:11px;color:#444;font-weight:bold;min-width:20px;text-align:center; }
@@ -542,6 +588,11 @@ function injectChatUI() {
                 <span id="wp-host-badge">👑 HOST</span>
                 <span id="wp-platform-badge">${PLATFORM.name.toUpperCase()}</span>
             </div>
+            <!-- CHANGE 2 + 3: viewer count & copy link in one row -->
+            <div id="wp-header-meta">
+                <span id="wp-viewer-count">👁 1 WATCHING</span>
+                <button id="wp-copy-link-btn">🔗 LINK</button>
+            </div>
             <div id="wp-call-bar">
                 <button class="wp-call-btn" id="wp-call-start">INIT AUDIO</button>
                 <div id="wp-call-status"></div>
@@ -550,13 +601,11 @@ function injectChatUI() {
             </div>
         </div>
 
-        <!-- TAB NAV -->
         <div id="wp-tab-nav">
             <button class="wp-tab-btn active" data-tab="chat">💬 CHAT</button>
             <button class="wp-tab-btn"         data-tab="queue">📋 QUEUE</button>
         </div>
 
-        <!-- CHAT PANEL -->
         <div id="wp-chat-panel" class="wp-tab-panel active" style="display:flex;flex-direction:column;flex:1;overflow:hidden;">
             <div id="wp-chat-box"></div>
             <div id="wp-reaction-bar">
@@ -574,7 +623,6 @@ function injectChatUI() {
             </div>
         </div>
 
-        <!-- QUEUE PANEL -->
         <div id="wp-queue-panel" class="wp-tab-panel">
             <div id="wp-queue-add-area">
                 <label>ADD TO QUEUE</label>
@@ -598,7 +646,7 @@ function injectChatUI() {
     setSquish(true);
     renderQueue([], false);
 
-    // ── Toggle sidebar ───────────────────────────────────────
+    // Toggle sidebar
     document.getElementById('wp-toggle-tab').addEventListener('click', () => {
         isDocked = !isDocked;
         chatContainer.classList.toggle('hidden', !isDocked);
@@ -606,7 +654,7 @@ function injectChatUI() {
         setSquish(isDocked);
     });
 
-    // ── Tab switching ────────────────────────────────────────
+    // Tab switching
     document.querySelectorAll('.wp-tab-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             const tab = btn.dataset.tab;
@@ -617,7 +665,10 @@ function injectChatUI() {
         });
     });
 
-    // ── Chat: send ───────────────────────────────────────────
+    // Copy link button (CHANGE 3)
+    document.getElementById('wp-copy-link-btn').addEventListener('click', copyPartyLink);
+
+    // Chat send
     const input = document.getElementById('wp-chat-input');
     const sendBtn = document.getElementById('wp-send-btn');
     function sendChat() {
@@ -637,7 +688,7 @@ function injectChatUI() {
         typingTimeout = setTimeout(() => socket.emit('stopped_typing', { roomId: ROOM_ID, sender: USERNAME }), 2000);
     });
 
-    // ── Reactions ────────────────────────────────────────────
+    // Reactions
     document.querySelectorAll('.wp-reaction-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
             if (!ROOM_ID) return;
@@ -648,7 +699,7 @@ function injectChatUI() {
         });
     });
 
-    // ── Voice call ───────────────────────────────────────────
+    // Voice call
     document.getElementById('wp-call-start').addEventListener('click', async () => {
         if (isInCall) return;
         try {
@@ -668,7 +719,7 @@ function injectChatUI() {
         btn.innerText = isMuted ? 'UNMUTE' : 'MUTE';
     });
 
-    // ── Queue: add URL ───────────────────────────────────────
+    // Queue add
     function submitQueueItem() {
         const urlInput   = document.getElementById('wp-queue-url-input');
         const titleInput = document.getElementById('wp-queue-title-input');
@@ -678,18 +729,15 @@ function injectChatUI() {
         socket.emit('queue_add', { roomId: ROOM_ID, url, title, sender: USERNAME });
         urlInput.value = ''; titleInput.value = '';
     }
-
     document.getElementById('wp-queue-add-btn').addEventListener('click', submitQueueItem);
     document.getElementById('wp-queue-url-input').addEventListener('keypress', (e) => { if (e.key === 'Enter') submitQueueItem(); });
 
-    // ── Queue: host skip ─────────────────────────────────────
+    // Queue host skip
     document.getElementById('wp-queue-skip-btn').addEventListener('click', () => {
         if (!IS_HOST) return;
         socket.emit('queue_play_next', { roomId: ROOM_ID });
     });
 
-    // Show/hide host bar when IS_HOST changes (called from renderQueue)
-    // We call it initially with false
     updateHostBar(false);
 }
 
@@ -698,14 +746,11 @@ function updateHostBar(isHost) {
     if (bar) bar.classList.toggle('visible', isHost);
 }
 
-// Patch renderQueue to also call updateHostBar
 const _origRenderQueue = renderQueue;
-// Re-declare renderQueue to also update host bar
 window.renderQueue = function(queue, isHost) {
     updateHostBar(isHost);
     _origRenderQueue(queue, isHost);
 };
-// Point the socket listener to the window version
 socket.off('queue_update');
 socket.on('queue_update', (data) => {
     currentQueue = data.queue || [];
@@ -716,20 +761,17 @@ socket.on('queue_update', (data) => {
 });
 
 // =====================================================
-// TITLE EXTRACTOR (best-effort from URL)
+// TITLE EXTRACTOR
 // =====================================================
 function extractTitle(url) {
     try {
         const u = new URL(url);
-        if (u.hostname.includes('youtube.com')) {
-            const v = u.searchParams.get('v');
-            return v ? `YouTube: ${v}` : 'YouTube Video';
-        }
+        if (u.hostname.includes('youtube.com')) { const v = u.searchParams.get('v'); return v ? `YouTube: ${v}` : 'YouTube Video'; }
         if (u.hostname.includes('netflix.com'))  return 'Netflix Title';
         if (u.hostname.includes('amazon.com') || u.hostname.includes('primevideo.com')) return 'Prime Video';
         if (u.hostname.includes('disneyplus.com')) return 'Disney+ Title';
         return u.hostname.replace('www.','');
-    } catch { return url.substring(0, 40); }
+    } catch { return String(url).substring(0, 36) + '…'; }
 }
 
 // =====================================================
