@@ -5,12 +5,81 @@ let ROOM_ID  = "";
 let USERNAME = "Guest";
 let IS_HOST  = false;
 
+// =====================================================
+// AUTO-REJOIN AFTER QUEUE NAVIGATION
+// =====================================================
+(function restoreSessionIfNeeded() {
+    const saved = sessionStorage.getItem('wp_session');
+    if (!saved) return;
+    try {
+        const { room, username } = JSON.parse(saved);
+        if (!room) return;
+        const doRejoin = () => {
+            ROOM_ID  = room;
+            USERNAME = username || 'Guest';
+            socket.emit('join_room', ROOM_ID);
+            showNotification(`AUTO-SYNC: [${ROOM_ID}] // ID:[${USERNAME}]`);
+            injectChatUI();
+            socket.emit('chat_message', {
+                roomId: ROOM_ID,
+                text: "rejoined after navigation.",
+                sender: USERNAME,
+                isSystem: true
+            });
+        };
+        if (socket.connected) doRejoin();
+        else socket.once('connect', doRejoin);
+    } catch (e) {
+        console.error('WP: session restore error', e);
+    }
+})();
+
 socket.on('connect', () => console.log(`🔗 Connected: ${socket.id}`));
+
+// Auto-join from magic link (?wp=roomname in the URL)
+(function autoJoinFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const wpRoom = params.get('wp');
+    if (!wpRoom) return;
+
+    // Don't auto-join if already in a session (restoreSessionIfNeeded handled it)
+    const saved = sessionStorage.getItem('wp_session');
+    if (saved) return;
+
+    // Wait for socket, then join
+    // Username defaults to Guest — they can't type one from a link,
+    // so pull from chrome.storage if popup.js saved it previously
+    const doAutoJoin = (username) => {
+        ROOM_ID  = wpRoom;
+        USERNAME = username || 'Guest';
+        sessionStorage.setItem('wp_session', JSON.stringify({ room: ROOM_ID, username: USERNAME }));
+        socket.emit('join_room', ROOM_ID);
+        showNotification(`AUTO-JOIN: [${ROOM_ID}] // ID:[${USERNAME}]`);
+        injectChatUI();
+        socket.emit('chat_message', {
+            roomId: ROOM_ID,
+            text: "joined via party link.",
+            sender: USERNAME,
+            isSystem: true
+        });
+    };
+
+    // Try to get their saved username from storage, fall back to Guest
+    chrome.storage.local.get('wp_username', (result) => {
+        const username = result.wp_username || 'Guest';
+        if (socket.connected) {
+            doAutoJoin(username);
+        } else {
+            socket.once('connect', () => doAutoJoin(username));
+        }
+    });
+})();
 
 chrome.runtime.onMessage.addListener((request) => {
     if (request.action === "join_room") {
         ROOM_ID  = request.room;
         USERNAME = request.username;
+        sessionStorage.setItem('wp_session', JSON.stringify({ room: ROOM_ID, username: USERNAME }));
         socket.emit('join_room', ROOM_ID);
         showNotification(`SYS.CONNECT: [${ROOM_ID}] // ID:[${USERNAME}]`);
         injectChatUI();
@@ -22,16 +91,88 @@ chrome.runtime.onMessage.addListener((request) => {
 // PLATFORM DETECTION
 // =====================================================
 const PLATFORMS = {
-    youtube: { match: () => location.hostname.includes('youtube.com'), squishSelectors: ['ytd-app','ytd-masthead','body','html'], sidebarMode: 'squish', isAd: () => !!document.querySelector('.ad-showing,.ytp-ad-player-overlay,.ytp-ad-text') },
-    netflix: { match: () => location.hostname.includes('netflix.com'), squishSelectors: ['.watch-video','.NFPlayer','body','html'], sidebarMode: 'overlay', isAd: () => false },
-    prime:   { match: () => location.hostname.includes('amazon.com') || location.hostname.includes('primevideo.com'), squishSelectors: ['.webPlayerSDKContainer','.dv-player-fullscreen','body','html'], sidebarMode: 'overlay', isAd: () => !!document.querySelector('.atvwebplayersdk-ad-timer-remaining,[data-testid="ad-badge"]') },
-    disney:  { match: () => location.hostname.includes('disneyplus.com'), squishSelectors: ['.hudson-container','body','html'], sidebarMode: 'overlay', isAd: () => !!document.querySelector('.ad-overlay,[class*="AdContainer"]') },
-    hbo:     { match: () => location.hostname.includes('max.com') || location.hostname.includes('hbomax.com'), squishSelectors: ['.watch-player','body','html'], sidebarMode: 'overlay', isAd: () => !!document.querySelector('[class*="ad-label"],[class*="AdContainer"]') },
-    hulu:    { match: () => location.hostname.includes('hulu.com'), squishSelectors: ['.site-player','body','html'], sidebarMode: 'overlay', isAd: () => !!document.querySelector('.ad-countdown,[class*="AdContainer"]') },
+    youtube: {
+        match: () => location.hostname.includes('youtube.com'),
+        squishSelectors: ['ytd-app','ytd-masthead','body','html'],
+        sidebarMode: 'squish',
+        isAd: () => !!document.querySelector('.ad-showing,.ytp-ad-player-overlay,.ytp-ad-text'),
+        // YouTube handles full href navigation fine
+        navigate: (url) => { window.location.href = url; }
+    },
+    netflix: {
+        match: () => location.hostname.includes('netflix.com'),
+        squishSelectors: ['.watch-video','.NFPlayer','body','html'],
+        sidebarMode: 'overlay',
+        isAd: () => false,
+        // Netflix M7375: NEVER use window.location.href on watch URLs.
+        // Use history.pushState so Netflix's own SPA router picks it up
+        // without triggering the DRM "programmatic navigation" block.
+        navigate: (url) => {
+            try {
+                const u = new URL(url);
+                // Only SPA-navigate watch pages; let other Netflix pages do a normal load
+                if (u.pathname.startsWith('/watch')) {
+                    history.pushState({}, '', url);
+                    // Dispatch a popstate so Netflix's router reacts
+                    window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+                    // Also try clicking a matching link if Netflix rendered one
+                    const link = document.querySelector(`a[href*="${u.pathname}"]`);
+                    if (link) link.click();
+                } else {
+                    window.location.href = url;
+                }
+            } catch {
+                window.location.href = url;
+            }
+        }
+    },
+    prime: {
+        match: () => location.hostname.includes('amazon.com') || location.hostname.includes('primevideo.com'),
+        squishSelectors: ['.webPlayerSDKContainer','.dv-player-fullscreen','body','html'],
+        sidebarMode: 'overlay',
+        isAd: () => !!document.querySelector('.atvwebplayersdk-ad-timer-remaining,[data-testid="ad-badge"]'),
+        // Prime Video also uses a SPA router — pushState avoids their equivalent of M7375
+        navigate: (url) => {
+            try {
+                history.pushState({}, '', url);
+                window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+            } catch {
+                window.location.href = url;
+            }
+        }
+    },
+    disney: {
+        match: () => location.hostname.includes('disneyplus.com'),
+        squishSelectors: ['.hudson-container','body','html'],
+        sidebarMode: 'overlay',
+        isAd: () => !!document.querySelector('.ad-overlay,[class*="AdContainer"]'),
+        navigate: (url) => { window.location.href = url; }
+    },
+    hbo: {
+        match: () => location.hostname.includes('max.com') || location.hostname.includes('hbomax.com'),
+        squishSelectors: ['.watch-player','body','html'],
+        sidebarMode: 'overlay',
+        isAd: () => !!document.querySelector('[class*="ad-label"],[class*="AdContainer"]'),
+        navigate: (url) => { window.location.href = url; }
+    },
+    hulu: {
+        match: () => location.hostname.includes('hulu.com'),
+        squishSelectors: ['.site-player','body','html'],
+        sidebarMode: 'overlay',
+        isAd: () => !!document.querySelector('.ad-countdown,[class*="AdContainer"]'),
+        navigate: (url) => { window.location.href = url; }
+    },
 };
+
 function detectPlatform() {
     for (const [name, cfg] of Object.entries(PLATFORMS)) if (cfg.match()) return { name, ...cfg };
-    return { name: 'generic', squishSelectors: ['body','html'], sidebarMode: 'overlay', isAd: () => false };
+    return {
+        name: 'generic',
+        squishSelectors: ['body','html'],
+        sidebarMode: 'overlay',
+        isAd: () => false,
+        navigate: (url) => { window.location.href = url; }
+    };
 }
 const PLATFORM = detectPlatform();
 
@@ -89,35 +230,20 @@ function formatTime(s) {
 }
 
 // =====================================================
-// CHANGE 1: AD WATCHER — MutationObserver instead of setInterval
-// Fires only when DOM actually changes (~90% less CPU during normal playback)
-// Disconnects automatically when not in a room
+// AD WATCHER — MutationObserver
 // =====================================================
-let isInAd = false, isBuffering = false;
-let _adObserver = null;
+let isInAd = false, isBuffering = false, _adObserver = null;
 
 function startAdWatcher() {
-    // Don't create a second observer if one is already running
     if (_adObserver) return;
-
     _adObserver = new MutationObserver(() => {
-        // Guard: only emit when actually in a room
         if (!ROOM_ID) return;
-
         const adNow = PLATFORM.isAd();
-        if (adNow && !isInAd) {
-            isInAd = true;
-            socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'ad_start' });
-        } else if (!adNow && isInAd) {
-            isInAd = false;
-            socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'ad_end' });
-        }
+        if (adNow && !isInAd)      { isInAd = true;  socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'ad_start' }); }
+        else if (!adNow && isInAd) { isInAd = false; socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'ad_end'   }); }
     });
-
-    // Watch the whole body for any DOM change — ad overlays appear/disappear here
     _adObserver.observe(document.body, { childList: true, subtree: true });
 }
-
 function stopAdWatcher() {
     if (_adObserver) { _adObserver.disconnect(); _adObserver = null; }
     isInAd = false;
@@ -152,23 +278,85 @@ function attachVideoListeners() {
 }
 
 // =====================================================
-// NAVIGATE TO URL (queue-driven redirect)
+// NAVIGATE TO URL — platform-aware, no DRM triggers
 // =====================================================
 socket.on('navigate_to', (data) => {
     const { url } = data;
     if (!url) return;
-    if (window.location.href === url) return; // prevent infinite redirect loop
-    showNotification(`▶ LOADING: ${data.title || url}`);
+    if (window.location.href === url) return;
+
+    // Save session before any navigation
+    if (ROOM_ID) {
+        sessionStorage.setItem('wp_session', JSON.stringify({ room: ROOM_ID, username: USERNAME }));
+    }
+
     video = null; videoListenersAttached = false;
-    stopAdWatcher(); // disconnect observer before navigating away
+    stopAdWatcher();
+
+    // Netflix blocks script-driven navigation to /watch/ URLs (Error M7375)
+    // Fix: show a one-click prompt instead of auto-redirecting
+    // One real user gesture satisfies Netflix's DRM navigator check
+    if (PLATFORM.name === 'netflix') {
+        showClickToJoin(url, data.title);
+        return;
+    }
+
+    // All other platforms: normal redirect
+    showNotification(`▶ LOADING: ${data.title || url}`);
     setTimeout(() => { window.location.href = url; }, 1200);
 });
 
-socket.on('queue_empty', () => {
-    appendStatusMessage('📭 Queue is empty — add something to watch!', 'buffer');
-    renderQueue([], IS_HOST);
-});
+function showClickToJoin(url, title) {
+    // Remove any existing prompt
+    document.getElementById('wp-join-prompt')?.remove();
 
+    const prompt = document.createElement('div');
+    prompt.id = 'wp-join-prompt';
+    prompt.style.cssText = `
+        position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+        background: rgba(7,7,12,0.97); border: 2px solid #0ff;
+        box-shadow: 0 0 30px rgba(0,255,255,0.4), inset 0 0 20px rgba(0,255,255,0.05);
+        padding: 32px 40px; z-index: 2147483647; text-align: center;
+        font-family: 'Share Tech Mono', monospace; color: #0ff;
+        min-width: 320px;
+    `;
+    prompt.innerHTML = `
+        <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px;">WATCH PARTY</div>
+        <div style="font-size:15px;font-weight:bold;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;text-shadow:0 0 8px #0ff;">
+            ▶ NOW PLAYING
+        </div>
+        <div style="font-size:12px;color:#aaa;margin-bottom:24px;max-width:260px;margin-left:auto;margin-right:auto;">
+            ${title || 'Next in queue'}
+        </div>
+        <button id="wp-join-btn" style="
+            background: transparent; border: 2px solid #0ff; color: #0ff;
+            padding: 12px 32px; font-size: 14px; font-family: 'Share Tech Mono', monospace;
+            font-weight: bold; text-transform: uppercase; letter-spacing: 2px;
+            cursor: pointer; transition: all 0.2s;
+            box-shadow: 0 0 10px rgba(0,255,255,0.3), inset 0 0 10px rgba(0,255,255,0.05);
+        ">
+            JOIN NOW →
+        </button>
+        <div style="font-size:10px;color:#444;margin-top:16px;text-transform:uppercase;">
+            Click to sync with your party
+        </div>
+    `;
+    document.body.appendChild(prompt);
+
+    // Hover effect
+    const btn = document.getElementById('wp-join-btn');
+    btn.addEventListener('mouseover', () => { btn.style.background = '#0ff'; btn.style.color = '#000'; });
+    btn.addEventListener('mouseout',  () => { btn.style.background = 'transparent'; btn.style.color = '#0ff'; });
+
+    // Real user click → Netflix accepts this as trusted navigation
+    btn.addEventListener('click', () => {
+        prompt.remove();
+        window.location.href = url;
+    });
+
+    // Auto-dismiss after 60s (in case they close the session)
+    setTimeout(() => prompt?.remove(), 60000);
+}
 // =====================================================
 // USER STATUS → CHAT
 // =====================================================
@@ -181,7 +369,7 @@ socket.on('user_status', (data) => {
 });
 
 // =====================================================
-// CHANGE 2: VIEWER COUNT — live member count in header
+// VIEWER COUNT
 // =====================================================
 socket.on('room_count', (data) => {
     const el = document.getElementById('wp-viewer-count');
@@ -310,17 +498,10 @@ function renderQueue(queue, isHost) {
     const container = document.getElementById('wp-queue-list');
     if (!container) return;
     container.innerHTML = '';
-
     if (!queue.length) {
-        container.innerHTML = `
-            <div class="wp-queue-empty">
-                <div class="wp-queue-empty-icon">📭</div>
-                <div class="wp-queue-empty-text">QUEUE IS EMPTY</div>
-                <div class="wp-queue-empty-sub">Add a URL above to start the party</div>
-            </div>`;
+        container.innerHTML = `<div class="wp-queue-empty"><div class="wp-queue-empty-icon">📭</div><div class="wp-queue-empty-text">QUEUE IS EMPTY</div><div class="wp-queue-empty-sub">Add a URL above to start the party</div></div>`;
         return;
     }
-
     queue.forEach((item, idx) => {
         const el = document.createElement('div');
         el.className = 'wp-queue-item';
@@ -333,18 +514,12 @@ function renderQueue(queue, isHost) {
             <div class="wp-queue-item-actions">
                 ${isHost ? `<button class="wp-q-btn wp-q-play" data-id="${item.id}" title="Play now">▶</button>` : ''}
                 ${isHost ? `<button class="wp-q-btn wp-q-del"  data-id="${item.id}" title="Remove">✕</button>` : ''}
-            </div>
-        `;
+            </div>`;
         container.appendChild(el);
     });
-
     if (isHost) {
-        container.querySelectorAll('.wp-q-play').forEach(btn => {
-            btn.addEventListener('click', () => socket.emit('queue_play_item', { roomId: ROOM_ID, itemId: Number(btn.dataset.id) }));
-        });
-        container.querySelectorAll('.wp-q-del').forEach(btn => {
-            btn.addEventListener('click', () => socket.emit('queue_remove', { roomId: ROOM_ID, itemId: Number(btn.dataset.id) }));
-        });
+        container.querySelectorAll('.wp-q-play').forEach(btn => { btn.addEventListener('click', () => socket.emit('queue_play_item', { roomId: ROOM_ID, itemId: Number(btn.dataset.id) })); });
+        container.querySelectorAll('.wp-q-del').forEach(btn  => { btn.addEventListener('click', () => socket.emit('queue_remove',    { roomId: ROOM_ID, itemId: Number(btn.dataset.id) })); });
     }
 }
 
@@ -402,19 +577,16 @@ function setSquish(isDocked) {
 }
 
 // =====================================================
-// CHANGE 3: COPY PARTY LINK
+// COPY PARTY LINK
 // =====================================================
 function copyPartyLink() {
     const url = new URL(window.location.href);
     url.searchParams.set('wp', ROOM_ID);
     navigator.clipboard.writeText(url.toString()).then(() => {
         showNotification('🔗 PARTY LINK COPIED!');
-        // Flash the button text as feedback
         const btn = document.getElementById('wp-copy-link-btn');
         if (btn) { btn.innerText = 'COPIED!'; setTimeout(() => { btn.innerText = '🔗 LINK'; }, 2000); }
-    }).catch(() => {
-        showNotification('ERR: CLIPBOARD ACCESS DENIED');
-    });
+    }).catch(() => showNotification('ERR: CLIPBOARD ACCESS DENIED'));
 }
 
 // =====================================================
@@ -430,34 +602,25 @@ function injectChatUI() {
 
     const style = document.createElement('style');
     style.textContent = `
-        :root {
-            --cy-bg:#07070c; --cy-cyan:#0ff; --cy-pink:#ff003c;
-            --cy-yellow:#f0ea00; --cy-green:#00ff88;
-        }
+        :root { --cy-bg:#07070c; --cy-cyan:#0ff; --cy-pink:#ff003c; --cy-yellow:#f0ea00; --cy-green:#00ff88; }
 
-        /* MATRIX GRID */
-        #wp-matrix-grid { display:grid; grid-template-columns:repeat(var(--wp-mcols,10),1fr); grid-template-rows:repeat(var(--wp-mrows,20),1fr); position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:0;overflow:hidden; }
+        #wp-matrix-grid { display:grid;grid-template-columns:repeat(var(--wp-mcols,10),1fr);grid-template-rows:repeat(var(--wp-mrows,20),1fr);position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:0;overflow:hidden; }
         .wp-mtile { pointer-events:all;display:flex;align-items:center;justify-content:center;font-family:'Courier New',monospace;font-size:.72rem;cursor:default;user-select:none;opacity:calc(.06 + var(--wp-mi,0)*.85);color:hsl(120,100%,calc(40% + var(--wp-mi,0)*42%));text-shadow:0 0 calc(var(--wp-mi,0)*12px) hsl(120,100%,55%);transform:scale(calc(1+var(--wp-mi,0)*.18));transition:color .18s,text-shadow .18s,opacity .18s,transform .18s; }
         .wp-mtile-glitch { animation:wp-tile-glitch .22s ease !important; }
         @keyframes wp-tile-glitch { 0%{transform:scale(1);color:#0f0} 50%{transform:scale(1.3);color:#fff;text-shadow:0 0 10px #fff} 100%{transform:scale(1);color:#0f0} }
 
-        /* CONTAINER */
         #wp-chat-container { position:fixed;top:0;right:0;width:350px;height:100vh;background:rgba(7,7,12,.97);color:var(--cy-cyan);z-index:2147483646;display:flex;flex-direction:column;font-family:'Share Tech Mono',monospace;border-left:2px solid var(--cy-pink);box-shadow:-5px 0 25px rgba(255,0,60,.5),inset 0 0 40px rgba(0,255,255,.04);transition:transform .3s cubic-bezier(.4,0,.2,1);overflow:visible; }
         #wp-chat-container.hidden { transform:translateX(100%); }
         #wp-chat-container::after { content:"";position:absolute;inset:0;background:linear-gradient(rgba(18,16,16,0) 50%,rgba(0,0,0,.1) 50%),linear-gradient(90deg,rgba(255,0,0,.03),rgba(0,255,0,.01),rgba(0,0,255,.03));background-size:100% 3px,3px 100%;pointer-events:none;z-index:9998;overflow:hidden; }
 
-        /* TOGGLE TAB */
         #wp-toggle-tab { position:absolute;left:-42px;top:50vh;transform:translateY(-50%);width:40px;height:60px;background:rgba(7,7,12,.98);color:var(--cy-pink);border:2px solid var(--cy-pink);border-right:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:-4px 0 12px rgba(255,0,60,.5);transition:background .1s,color .1s;text-shadow:0 0 6px var(--cy-pink);z-index:10000;font-family:'Share Tech Mono',monospace; }
         #wp-toggle-tab:hover { background:var(--cy-pink);color:#000;box-shadow:-4px 0 20px var(--cy-pink); }
 
-        /* HEADER */
         #wp-chat-header { background:rgba(7,7,12,.99);padding:10px 14px;font-weight:bold;font-size:13px;display:flex;flex-direction:column;gap:7px;border-bottom:2px solid var(--cy-cyan);text-transform:uppercase;letter-spacing:1px;box-shadow:0 4px 12px rgba(0,255,255,.2);position:relative;z-index:10; }
         #wp-header-top { display:flex;justify-content:space-between;align-items:center;gap:6px;text-shadow:0 0 6px var(--cy-cyan); }
         #wp-header-top span:first-child { flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
         #wp-host-badge { display:none;font-size:9px;color:var(--cy-yellow);border:1px solid var(--cy-yellow);padding:2px 6px;text-shadow:0 0 4px var(--cy-yellow);white-space:nowrap;flex-shrink:0; }
         #wp-platform-badge { font-size:9px;color:#555;border:1px solid #333;padding:2px 6px;white-space:nowrap;flex-shrink:0; }
-
-        /* HEADER SECOND ROW: viewer count + copy link */
         #wp-header-meta { display:flex;align-items:center;justify-content:space-between;gap:8px; }
         #wp-viewer-count { font-size:10px;color:#666;letter-spacing:1px; }
         #wp-copy-link-btn { background:transparent;border:1px solid #444;color:#888;padding:3px 8px;font-size:10px;font-family:'Share Tech Mono',monospace;font-weight:bold;cursor:pointer;text-transform:uppercase;transition:all .2s;letter-spacing:1px;white-space:nowrap; }
@@ -478,20 +641,17 @@ function injectChatUI() {
         #wp-call-mute:hover { border-color:#fff;color:#fff; }
         #wp-call-mute.muted { border-color:var(--cy-yellow);color:var(--cy-yellow); }
 
-        /* TAB NAV */
         #wp-tab-nav { display:flex;background:rgba(0,0,0,.6);border-bottom:1px solid rgba(0,255,255,.15);position:relative;z-index:10; }
         .wp-tab-btn { flex:1;padding:8px 0;font-size:11px;font-family:'Share Tech Mono',monospace;font-weight:bold;text-transform:uppercase;letter-spacing:1px;border:none;background:transparent;color:#555;cursor:pointer;transition:all .2s;border-bottom:2px solid transparent; }
         .wp-tab-btn:hover { color:#aaa; }
         .wp-tab-btn.active { color:var(--cy-cyan);border-bottom:2px solid var(--cy-cyan);text-shadow:0 0 6px var(--cy-cyan); }
 
-        /* CHAT BOX */
         #wp-chat-box { flex-grow:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth;position:relative;z-index:10; }
         #wp-chat-box::-webkit-scrollbar { width:4px; }
         #wp-chat-box::-webkit-scrollbar-thumb { background:var(--cy-cyan); }
         .wp-tab-panel { display:none;flex:1;flex-direction:column;overflow:hidden; }
         .wp-tab-panel.active { display:flex; }
 
-        /* STATUS MESSAGES */
         .wp-status-msg { text-align:center;font-size:11px;font-weight:bold;font-family:'Share Tech Mono',monospace;text-transform:uppercase;padding:5px 10px;margin:2px 0;position:relative;z-index:2;animation:fadeIn .3s ease; }
         .wp-status-play   { color:#00ff88;background:rgba(0,255,136,.1);border:1px solid rgba(0,255,136,.25);text-shadow:0 0 5px #00ff88; }
         .wp-status-pause  { color:#ffaa00;background:rgba(255,170,0,.1); border:1px solid rgba(255,170,0,.25);text-shadow:0 0 5px #ffaa00; }
@@ -499,7 +659,6 @@ function injectChatUI() {
         .wp-status-ad     { color:#ff003c;background:rgba(255,0,60,.12); border:1px solid rgba(255,0,60,.35);text-shadow:0 0 5px #ff003c; }
         .wp-status-buffer { color:#888;   background:rgba(80,80,80,.1);  border:1px solid rgba(80,80,80,.25); }
 
-        /* CHAT BUBBLES */
         .wp-msg-wrapper { display:flex;flex-direction:column;max-width:90%;animation:wp-glitch-anim .3s ease; }
         .wp-msg-wrapper.sender   { align-self:flex-end;  align-items:flex-end; }
         .wp-msg-wrapper.receiver { align-self:flex-start;align-items:flex-start; }
@@ -512,7 +671,6 @@ function injectChatUI() {
         .wp-msg-bubble:hover { animation:wp-glitch-hover .2s infinite linear alternate-reverse; }
         .wp-timestamp { font-size:10px;color:#555;margin-top:4px;font-weight:bold; }
 
-        /* QUEUE PANEL */
         #wp-queue-panel { display:none;flex-direction:column;flex:1;overflow:hidden;position:relative;z-index:10; }
         #wp-queue-panel.active { display:flex; }
         #wp-queue-add-area { padding:12px 14px;background:rgba(0,0,0,.7);border-bottom:1px solid rgba(0,255,255,.15);position:relative;z-index:10;display:flex;flex-direction:column;gap:8px; }
@@ -551,12 +709,10 @@ function injectChatUI() {
         .wp-q-del  { border-color:var(--cy-pink);color:var(--cy-pink); }
         .wp-q-del:hover  { background:var(--cy-pink);color:#000; }
 
-        /* REACTION BAR */
         #wp-reaction-bar { display:flex;gap:8px;padding:9px 13px;background:rgba(7,7,12,.97);border-top:1px solid rgba(0,255,255,.12);position:relative;z-index:10;flex-wrap:wrap; }
         .wp-reaction-btn { background:rgba(0,0,0,.8);border:1px solid #555;color:#fff;cursor:pointer;padding:4px 8px;font-size:16px;transition:all .1s; }
         .wp-reaction-btn:hover { border-color:var(--cy-yellow);box-shadow:0 0 10px var(--cy-yellow);transform:scale(1.15); }
 
-        /* INPUT AREA */
         #wp-input-area { display:flex;padding:12px;background:rgba(0,0,0,.98);gap:8px;align-items:center;border-top:2px solid var(--cy-cyan);position:relative;z-index:10; }
         #wp-chat-input { flex-grow:1;background:rgba(7,7,12,1);border:1px solid #444;color:var(--cy-cyan);padding:10px 12px;outline:none;font-size:13px;font-family:'Share Tech Mono',monospace;box-shadow:inset 0 0 6px rgba(0,255,255,.12); }
         #wp-chat-input:focus { border-color:var(--cy-cyan);box-shadow:inset 0 0 12px rgba(0,255,255,.35); }
@@ -567,7 +723,6 @@ function injectChatUI() {
         .wp-icon-btn { border-color:#555;color:#666;box-shadow:none;background:rgba(0,0,0,.6); }
         .wp-icon-btn:hover { border-color:var(--cy-pink);color:var(--cy-pink);background:rgba(0,0,0,.8); }
 
-        /* ANIMATIONS */
         @keyframes wp-glitch-anim { 0%{transform:translate(0)} 20%{transform:translate(-2px,1px)} 40%{transform:translate(-1px,-1px)} 60%{transform:translate(2px,1px)} 80%{transform:translate(1px,-1px)} 100%{transform:translate(0)} }
         @keyframes wp-glitch-hover { 0%{transform:skew(0deg)} 20%{transform:skew(-5deg);filter:hue-rotate(90deg)} 40%{transform:skew(5deg)} 60%{transform:translate(1px,1px)} 80%{transform:translate(-1px,-1px)} 100%{transform:skew(0deg)} }
         .wp-dot { display:inline-block;width:6px;height:6px;background:var(--cy-cyan);box-shadow:0 0 5px var(--cy-cyan);animation:wp-dot-blink 1s infinite;border-radius:0; }
@@ -581,14 +736,12 @@ function injectChatUI() {
     chatContainer.innerHTML = `
         <div id="wp-matrix-grid"></div>
         <button id="wp-toggle-tab" title="Toggle">[ ]</button>
-
         <div id="wp-chat-header">
             <div id="wp-header-top">
                 <span>NET://ROOM_${ROOM_ID}</span>
                 <span id="wp-host-badge">👑 HOST</span>
                 <span id="wp-platform-badge">${PLATFORM.name.toUpperCase()}</span>
             </div>
-            <!-- CHANGE 2 + 3: viewer count & copy link in one row -->
             <div id="wp-header-meta">
                 <span id="wp-viewer-count">👁 1 WATCHING</span>
                 <button id="wp-copy-link-btn">🔗 LINK</button>
@@ -600,12 +753,10 @@ function injectChatUI() {
                 <button class="wp-call-btn" id="wp-call-end">CUT LINE</button>
             </div>
         </div>
-
         <div id="wp-tab-nav">
             <button class="wp-tab-btn active" data-tab="chat">💬 CHAT</button>
-            <button class="wp-tab-btn"         data-tab="queue">📋 QUEUE</button>
+            <button class="wp-tab-btn" data-tab="queue">📋 QUEUE</button>
         </div>
-
         <div id="wp-chat-panel" class="wp-tab-panel active" style="display:flex;flex-direction:column;flex:1;overflow:hidden;">
             <div id="wp-chat-box"></div>
             <div id="wp-reaction-bar">
@@ -622,7 +773,6 @@ function injectChatUI() {
                 <button class="wp-action-btn" id="wp-send-btn">_></button>
             </div>
         </div>
-
         <div id="wp-queue-panel" class="wp-tab-panel">
             <div id="wp-queue-add-area">
                 <label>ADD TO QUEUE</label>
@@ -646,7 +796,6 @@ function injectChatUI() {
     setSquish(true);
     renderQueue([], false);
 
-    // Toggle sidebar
     document.getElementById('wp-toggle-tab').addEventListener('click', () => {
         isDocked = !isDocked;
         chatContainer.classList.toggle('hidden', !isDocked);
@@ -654,7 +803,6 @@ function injectChatUI() {
         setSquish(isDocked);
     });
 
-    // Tab switching
     document.querySelectorAll('.wp-tab-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             const tab = btn.dataset.tab;
@@ -665,10 +813,8 @@ function injectChatUI() {
         });
     });
 
-    // Copy link button (CHANGE 3)
     document.getElementById('wp-copy-link-btn').addEventListener('click', copyPartyLink);
 
-    // Chat send
     const input = document.getElementById('wp-chat-input');
     const sendBtn = document.getElementById('wp-send-btn');
     function sendChat() {
@@ -688,7 +834,6 @@ function injectChatUI() {
         typingTimeout = setTimeout(() => socket.emit('stopped_typing', { roomId: ROOM_ID, sender: USERNAME }), 2000);
     });
 
-    // Reactions
     document.querySelectorAll('.wp-reaction-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
             if (!ROOM_ID) return;
@@ -699,7 +844,6 @@ function injectChatUI() {
         });
     });
 
-    // Voice call
     document.getElementById('wp-call-start').addEventListener('click', async () => {
         if (isInCall) return;
         try {
@@ -719,7 +863,6 @@ function injectChatUI() {
         btn.innerText = isMuted ? 'UNMUTE' : 'MUTE';
     });
 
-    // Queue add
     function submitQueueItem() {
         const urlInput   = document.getElementById('wp-queue-url-input');
         const titleInput = document.getElementById('wp-queue-title-input');
@@ -731,8 +874,6 @@ function injectChatUI() {
     }
     document.getElementById('wp-queue-add-btn').addEventListener('click', submitQueueItem);
     document.getElementById('wp-queue-url-input').addEventListener('keypress', (e) => { if (e.key === 'Enter') submitQueueItem(); });
-
-    // Queue host skip
     document.getElementById('wp-queue-skip-btn').addEventListener('click', () => {
         if (!IS_HOST) return;
         socket.emit('queue_play_next', { roomId: ROOM_ID });
@@ -747,10 +888,7 @@ function updateHostBar(isHost) {
 }
 
 const _origRenderQueue = renderQueue;
-window.renderQueue = function(queue, isHost) {
-    updateHostBar(isHost);
-    _origRenderQueue(queue, isHost);
-};
+window.renderQueue = function(queue, isHost) { updateHostBar(isHost); _origRenderQueue(queue, isHost); };
 socket.off('queue_update');
 socket.on('queue_update', (data) => {
     currentQueue = data.queue || [];
@@ -760,9 +898,6 @@ socket.on('queue_update', (data) => {
     if (badge) badge.style.display = IS_HOST ? 'inline-block' : 'none';
 });
 
-// =====================================================
-// TITLE EXTRACTOR
-// =====================================================
 function extractTitle(url) {
     try {
         const u = new URL(url);
@@ -774,9 +909,6 @@ function extractTitle(url) {
     } catch { return String(url).substring(0, 36) + '…'; }
 }
 
-// =====================================================
-// APPEND HELPERS
-// =====================================================
 function appendStatusMessage(text, type) {
     const box = document.getElementById('wp-chat-box');
     if (!box) return;
