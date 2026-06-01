@@ -36,19 +36,25 @@ let IS_HOST  = false;
 
 socket.on('connect', () => console.log(`🔗 Connected: ${socket.id}`));
 
-// Auto-join from magic link (?wp=roomname in the URL)
+// =====================================================
+// AUTO-JOIN FROM MAGIC LINK  (?wp=roomname in the URL)
+// Friend opens the copied link → extension reads the
+// ?wp= param and silently joins the room. No popup needed.
+// =====================================================
 (function autoJoinFromUrl() {
-    const params = new URLSearchParams(window.location.search);
-    const wpRoom = params.get('wp');
+    const params  = new URLSearchParams(window.location.search);
+    const wpRoom  = params.get('wp');
     if (!wpRoom) return;
 
-    // Don't auto-join if already in a session (restoreSessionIfNeeded handled it)
+    // If restoreSessionIfNeeded already handled a session, don't double-join
     const saved = sessionStorage.getItem('wp_session');
-    if (saved) return;
+    if (saved) {
+        try {
+            const { room } = JSON.parse(saved);
+            if (room === wpRoom) return; // already in this room
+        } catch {}
+    }
 
-    // Wait for socket, then join
-    // Username defaults to Guest — they can't type one from a link,
-    // so pull from chrome.storage if popup.js saved it previously
     const doAutoJoin = (username) => {
         ROOM_ID  = wpRoom;
         USERNAME = username || 'Guest';
@@ -57,22 +63,29 @@ socket.on('connect', () => console.log(`🔗 Connected: ${socket.id}`));
         showNotification(`AUTO-JOIN: [${ROOM_ID}] // ID:[${USERNAME}]`);
         injectChatUI();
         socket.emit('chat_message', {
-            roomId: ROOM_ID,
-            text: "joined via party link.",
-            sender: USERNAME,
+            roomId:   ROOM_ID,
+            text:     "joined via party link.",
+            sender:   USERNAME,
             isSystem: true
         });
     };
 
-    // Try to get their saved username from storage, fall back to Guest
-    chrome.storage.local.get('wp_username', (result) => {
-        const username = result.wp_username || 'Guest';
-        if (socket.connected) {
-            doAutoJoin(username);
-        } else {
-            socket.once('connect', () => doAutoJoin(username));
-        }
-    });
+    // Pull their previously saved username (set by popup.js on last manual join)
+    // Wrapped in try/catch in case "storage" permission is missing from manifest.json
+    const joinWithUsername = (username) => {
+        if (socket.connected) doAutoJoin(username);
+        else socket.once('connect', () => doAutoJoin(username));
+    };
+    try {
+        chrome.storage.local.get('wp_username', (result) => {
+            joinWithUsername((result && result.wp_username) ? result.wp_username : 'Guest');
+        });
+    } catch (e) {
+        // "storage" permission missing from manifest.json — falling back to Guest
+        // Fix: add "storage" to permissions array in manifest.json
+        console.warn('WP: Add "storage" to manifest.json permissions to restore usernames.');
+        joinWithUsername('Guest');
+    }
 })();
 
 chrome.runtime.onMessage.addListener((request) => {
@@ -162,6 +175,25 @@ const PLATFORMS = {
         isAd: () => !!document.querySelector('.ad-countdown,[class*="AdContainer"]'),
         navigate: (url) => { window.location.href = url; }
     },
+    // HiAnime: video lives inside a cross-origin iframe (MegaPlay/AniWatch player)
+    // Direct <video> access is blocked by browser security (same-origin policy).
+    // We use postMessage to control the player and listen for its events instead.
+    hianime: {
+        match: () => location.hostname.includes('hianime.biz.pl'),
+        squishSelectors: ['body','html'],
+        sidebarMode: 'overlay',
+        isAd: () => false,
+        navigate: (url) => { window.location.href = url; },
+        getIframe: () => document.querySelector(
+            'iframe[src*="megaplay.buzz"], iframe[src*="animeplay.cfd"], iframe[src*="hianimeapi"]'
+        ),
+        postCmd: (cmd) => {
+            const iframe = PLATFORMS.hianime.getIframe();
+            if (iframe && iframe.contentWindow) {
+                iframe.contentWindow.postMessage(cmd, '*');
+            }
+        }
+    },
 };
 
 function detectPlatform() {
@@ -192,6 +224,19 @@ function findBestVideo() {
     }, null);
 }
 function tryAttachVideo() {
+    // HiAnime: no direct <video> access — attach once the iframe is present instead
+    if (PLATFORM.name === 'hianime') {
+        if (!videoListenersAttached) {
+            const iframe = PLATFORMS.hianime.getIframe();
+            if (iframe) {
+                videoListenersAttached = true;
+                video = true; // sentinel so pollers stop
+                attachVideoListeners();
+            }
+        }
+        return;
+    }
+
     const found = findBestVideo();
     if (found && found !== video) {
         video = found;
@@ -253,6 +298,14 @@ function stopAdWatcher() {
 // VIDEO LISTENERS
 // =====================================================
 function attachVideoListeners() {
+    // ── HiAnime: video is inside a cross-origin iframe ──────────────
+    // We can't access video directly. Use postMessage to control the
+    // MegaPlay iframe player and listen for its events via window.message.
+    if (PLATFORM.name === 'hianime') {
+        attachHiAnimeListeners();
+        return;
+    }
+
     if (!video) return;
     startAdWatcher();
     video.addEventListener('play',    () => { if (isRemoteAction || isInAd) return; socket.emit('sync_state',  { roomId: ROOM_ID, action: 'play',   time: video.currentTime }); socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'play',  timestamp: formatTime(video.currentTime) }); });
@@ -278,85 +331,146 @@ function attachVideoListeners() {
 }
 
 // =====================================================
+// HIANIME — postMessage iframe sync
+// MegaPlay player sends events via window.postMessage
+// and accepts commands the same way.
+// =====================================================
+let _hiAnimeCurrentTime = 0; // track time since we can't read it directly
+
+function attachHiAnimeListeners() {
+    startAdWatcher();
+
+    // Listen for events FROM the MegaPlay iframe player
+    window.addEventListener('message', (event) => {
+        // Only process messages from known player origins
+        if (!event.origin.includes('megaplay') &&
+            !event.origin.includes('animeplay') &&
+            !event.origin.includes('hianimeapi')) return;
+
+        const msg = event.data;
+        if (!msg || !msg.type) return;
+
+        // MegaPlay emits: { type: 'timeupdate', currentTime: N }
+        // { type: 'play' } { type: 'pause' } { type: 'seeked', currentTime: N }
+        if (msg.type === 'timeupdate' && msg.currentTime !== undefined) {
+            _hiAnimeCurrentTime = msg.currentTime;
+        }
+
+        if (isRemoteAction) return;
+
+        if (msg.type === 'play') {
+            socket.emit('sync_state',  { roomId: ROOM_ID, action: 'play',   time: _hiAnimeCurrentTime });
+            socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'play',  timestamp: formatTime(_hiAnimeCurrentTime) });
+        }
+        if (msg.type === 'pause') {
+            socket.emit('sync_state',  { roomId: ROOM_ID, action: 'pause',  time: _hiAnimeCurrentTime });
+            socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'pause', timestamp: formatTime(_hiAnimeCurrentTime) });
+        }
+        if (msg.type === 'seeked') {
+            _hiAnimeCurrentTime = msg.currentTime || _hiAnimeCurrentTime;
+            socket.emit('sync_state',  { roomId: ROOM_ID, action: 'seeked', time: _hiAnimeCurrentTime });
+            socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'seek',  timestamp: formatTime(_hiAnimeCurrentTime) });
+        }
+        if (msg.type === 'buffering') {
+            if (!isBuffering) { isBuffering = true;  socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'buffer_start' }); }
+        }
+        if (msg.type === 'buffered' || msg.type === 'canplay') {
+            if (isBuffering)  { isBuffering = false; socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'buffer_end'   }); }
+        }
+    });
+
+    // Helper: send a command to the iframe player
+    function sendToPlayer(cmd) {
+        const iframe = PLATFORMS.hianime.getIframe();
+        if (iframe && iframe.contentWindow) {
+            iframe.contentWindow.postMessage(cmd, '*');
+        }
+    }
+
+    // Receive sync commands from other party members
+    socket.off('sync_state');
+    socket.on('sync_state', (data) => {
+        isRemoteAction = true;
+
+        if (data.action === 'play') {
+            // Seek to correct time first, then play
+            sendToPlayer({ type: 'seek',  currentTime: data.time });
+            sendToPlayer({ type: 'play'  });
+        }
+        if (data.action === 'pause') {
+            sendToPlayer({ type: 'seek',  currentTime: data.time });
+            sendToPlayer({ type: 'pause' });
+        }
+        if (data.action === 'seeked') {
+            sendToPlayer({ type: 'seek',  currentTime: data.time });
+        }
+        if (data.message) showNotification(data.message);
+        setTimeout(() => { isRemoteAction = false; }, 800);
+    });
+
+    socket.on('latecomer_arrived', (data) => {
+        sendToPlayer({ type: 'pause' });
+        socket.emit('sync_state', {
+            roomId:  ROOM_ID,
+            action:  'pause',
+            time:    _hiAnimeCurrentTime,
+            message: `GUEST_${data.newUserId} DETECTED. SYNCING...`
+        });
+    });
+
+    console.log('✅ Watch Party: HiAnime postMessage sync active');
+    showNotification('HIANIME SYNC ACTIVE');
+}
+
+// =====================================================
 // NAVIGATE TO URL — platform-aware, no DRM triggers
 // =====================================================
 socket.on('navigate_to', (data) => {
     const { url } = data;
     if (!url) return;
-    if (window.location.href === url) return;
 
-    // Save session before any navigation
+    // Already on this URL — don't navigate, just sync video time
+    if (window.location.href === url) {
+        showNotification(`▶ ALREADY HERE: syncing...`);
+        return;
+    }
+
+    // Save session BEFORE any navigation attempt
     if (ROOM_ID) {
         sessionStorage.setItem('wp_session', JSON.stringify({ room: ROOM_ID, username: USERNAME }));
     }
 
-    video = null; videoListenersAttached = false;
-    stopAdWatcher();
+    showNotification(`▶ LOADING: ${data.title || url}`);
 
-    // Netflix blocks script-driven navigation to /watch/ URLs (Error M7375)
-    // Fix: show a one-click prompt instead of auto-redirecting
-    // One real user gesture satisfies Netflix's DRM navigator check
-    if (PLATFORM.name === 'netflix') {
-        showClickToJoin(url, data.title);
-        return;
+    // For SPA platforms (Netflix, Prime) — don't tear down the observer/video
+    // because pushState keeps the page alive. For href-based platforms, clean up.
+    const isSPA = ['netflix', 'prime'].includes(PLATFORM.name);
+
+    if (!isSPA) {
+        video = null;
+        videoListenersAttached = false;
+        stopAdWatcher();
     }
 
-    // All other platforms: normal redirect
-    showNotification(`▶ LOADING: ${data.title || url}`);
-    setTimeout(() => { window.location.href = url; }, 1200);
+    // Delay slightly so the notification is visible, then use platform navigate
+    setTimeout(() => {
+        PLATFORM.navigate(url);
+
+        // For SPA platforms: after pushState the video element is replaced —
+        // re-run the video finder after a short wait for the player to mount
+        if (isSPA) {
+            video = null;
+            videoListenersAttached = false;
+            setTimeout(() => { tryAttachVideo(); }, 2000);
+        }
+    }, 800);
 });
 
-function showClickToJoin(url, title) {
-    // Remove any existing prompt
-    document.getElementById('wp-join-prompt')?.remove();
+socket.on('queue_empty', () => {
+    appendStatusMessage('📭 Queue is empty — add something to watch!', 'buffer');
+    renderQueue([], IS_HOST);
+});
 
-    const prompt = document.createElement('div');
-    prompt.id = 'wp-join-prompt';
-    prompt.style.cssText = `
-        position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-        background: rgba(7,7,12,0.97); border: 2px solid #0ff;
-        box-shadow: 0 0 30px rgba(0,255,255,0.4), inset 0 0 20px rgba(0,255,255,0.05);
-        padding: 32px 40px; z-index: 2147483647; text-align: center;
-        font-family: 'Share Tech Mono', monospace; color: #0ff;
-        min-width: 320px;
-    `;
-    prompt.innerHTML = `
-        <div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:2px;margin-bottom:12px;">WATCH PARTY</div>
-        <div style="font-size:15px;font-weight:bold;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;text-shadow:0 0 8px #0ff;">
-            ▶ NOW PLAYING
-        </div>
-        <div style="font-size:12px;color:#aaa;margin-bottom:24px;max-width:260px;margin-left:auto;margin-right:auto;">
-            ${title || 'Next in queue'}
-        </div>
-        <button id="wp-join-btn" style="
-            background: transparent; border: 2px solid #0ff; color: #0ff;
-            padding: 12px 32px; font-size: 14px; font-family: 'Share Tech Mono', monospace;
-            font-weight: bold; text-transform: uppercase; letter-spacing: 2px;
-            cursor: pointer; transition: all 0.2s;
-            box-shadow: 0 0 10px rgba(0,255,255,0.3), inset 0 0 10px rgba(0,255,255,0.05);
-        ">
-            JOIN NOW →
-        </button>
-        <div style="font-size:10px;color:#444;margin-top:16px;text-transform:uppercase;">
-            Click to sync with your party
-        </div>
-    `;
-    document.body.appendChild(prompt);
-
-    // Hover effect
-    const btn = document.getElementById('wp-join-btn');
-    btn.addEventListener('mouseover', () => { btn.style.background = '#0ff'; btn.style.color = '#000'; });
-    btn.addEventListener('mouseout',  () => { btn.style.background = 'transparent'; btn.style.color = '#0ff'; });
-
-    // Real user click → Netflix accepts this as trusted navigation
-    btn.addEventListener('click', () => {
-        prompt.remove();
-        window.location.href = url;
-    });
-
-    // Auto-dismiss after 60s (in case they close the session)
-    setTimeout(() => prompt?.remove(), 60000);
-}
 // =====================================================
 // USER STATUS → CHAT
 // =====================================================

@@ -1,25 +1,41 @@
 {
   "manifest_version": 3,
-  "name": "Video Controller",
+  "name": "Watch Party",
   "version": "1.0",
-  "description": "Pause video from extension",
-  "permissions": ["activeTab", "scripting"],
+  "description": "Watch videos in sync with friends across Netflix, YouTube, Prime, Disney+, HiAnime and more.",
+
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "microphone"
+  ],
+
+  "host_permissions": [
+    "*://*.youtube.com/*",
+    "*://*.netflix.com/*",
+    "*://*.amazon.com/*",
+    "*://*.primevideo.com/*",
+    "*://*.disneyplus.com/*",
+    "*://*.max.com/*",
+    "*://*.hbomax.com/*",
+    "*://*.hulu.com/*",
+    "*://*.hianime.biz.pl/*",
+    "*://*.megaplay.buzz/*",
+    "*://*.animeplay.cfd/*"
+  ],
+
   "action": {
-    "default_popup": "popup.html",
-    "permissions": ["activeTab", "scripting", "storage", "microphone"]
+    "default_popup": "popup.html"
   },
+
   "content_scripts": [
-  {
-    "matches": [
-  "*://*.youtube.com/*",
-  "*://*.netflix.com/*",
-  "*://*.amazon.com/*",
-  "*://*.primevideo.com/*",
-  "*://*.disneyplus.com/*",
-  "*://*.max.com/*",
-  "*://*.hulu.com/*"
-],
-    "js": ["socket.io.min.js", "content.js"]
-  }
-]
+    {
+      "matches": [
+        "*://*.youtube.com/*"
+      ],
+      "js": ["socket.io.min.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
 }
