@@ -7,8 +7,7 @@
   "permissions": [
     "activeTab",
     "scripting",
-    "storage",
-    "microphone"
+    "storage"
   ],
 
   "host_permissions": [
@@ -22,7 +21,11 @@
     "*://*.hulu.com/*",
     "*://*.hianime.biz.pl/*",
     "*://*.megaplay.buzz/*",
-    "*://*.animeplay.cfd/*"
+    "*://*.animeplay.cfd/*",
+    "*://*.streamiloo.to/*",
+    "*://*.vidsrc.mov/*",
+    "*://*.vsembed.ru/*",
+    "*://*.cloudorchestranova.com/*"
   ],
 
   "action": {
@@ -36,6 +39,17 @@
       ],
       "js": ["socket.io.min.js", "content.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://*.vidsrc.mov/*",
+        "*://*.vsembed.ru/*",
+        "*://*.cloudorchestranova.com/*"
+      ],
+      "js": ["player-bridge.js"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_start"
     }
   ]
 }

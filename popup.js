@@ -25,7 +25,8 @@ const MANUAL_INJECT_HOSTS = [
     'max.com',
     'hbomax.com',
     'hulu.com',
-    'hianime.biz.pl'   // iframe-based anime player
+    'hianime.biz.pl',
+    'streamiloo.to'  // nested cross-origin player
 ];
 
 const ALL_SUPPORTED = [...AUTO_INJECT_HOSTS, ...MANUAL_INJECT_HOSTS];

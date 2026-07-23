@@ -194,6 +194,27 @@ const PLATFORMS = {
             }
         }
     },
+    streamiloo: {
+        match: () => location.hostname === 'streamiloo.to' || location.hostname.endsWith('.streamiloo.to'),
+        squishSelectors: ['body','html'],
+        sidebarMode: 'overlay',
+        isAd: () => false,
+        navigate: (url) => { window.location.href = url; },
+        usesPlayerBridge: true,
+        getIframe: () => document.querySelector(
+            '#playerFrame, iframe[src*="vidsrc.mov"], iframe[src*="vsembed.ru"]'
+        ),
+        postCmd: (command, currentTime) => {
+            const iframe = PLATFORMS.streamiloo.getIframe();
+            if (!iframe?.contentWindow) return;
+            iframe.contentWindow.postMessage({
+                source: 'watch-party-player-bridge',
+                kind: 'command',
+                command,
+                currentTime
+            }, '*');
+        }
+    },
 };
 
 function detectPlatform() {
@@ -236,6 +257,14 @@ function tryAttachVideo() {
         }
         return;
     }
+    if (PLATFORM.usesPlayerBridge) {
+        if (!videoListenersAttached && PLATFORM.getIframe()) {
+            videoListenersAttached = true;
+            video = true; // sentinel: the real video belongs to a cross-origin frame
+            attachVideoListeners();
+        }
+        return;
+    }
 
     const found = findBestVideo();
     if (found && found !== video) {
@@ -247,6 +276,10 @@ const _vPoll = setInterval(() => { tryAttachVideo(); if (video) clearInterval(_v
 new MutationObserver(() => { if (!video) tryAttachVideo(); }).observe(document.documentElement, { childList: true, subtree: true });
 document.addEventListener('visibilitychange', () => {
     if (document.hidden) return;
+    if (PLATFORM.usesPlayerBridge || PLATFORM.name === 'hianime') {
+        if (!videoListenersAttached) tryAttachVideo();
+        return;
+    }
     const fresh = findBestVideo();
     if (fresh && fresh !== video) { video = fresh; videoListenersAttached = false; attachVideoListeners(); videoListenersAttached = true; }
 });
@@ -305,6 +338,10 @@ function attachVideoListeners() {
         attachHiAnimeListeners();
         return;
     }
+    if (PLATFORM.usesPlayerBridge) {
+        attachPlayerBridgeListeners();
+        return;
+    }
 
     if (!video) return;
     startAdWatcher();
@@ -328,6 +365,68 @@ function attachVideoListeners() {
         video.pause();
         socket.emit('sync_state', { roomId: ROOM_ID, action: 'pause', time: video.currentTime, message: `GUEST_${data.newUserId} DETECTED. SYNCING...` });
     });
+}
+
+// =====================================================
+// STREAMILOO — cross-origin nested iframe sync
+// =====================================================
+let _bridgeCurrentTime = 0;
+
+function attachPlayerBridgeListeners() {
+    startAdWatcher();
+
+    window.addEventListener('message', (event) => {
+        const iframe = PLATFORM.getIframe();
+        if (!iframe?.contentWindow || event.source !== iframe.contentWindow) return;
+
+        const msg = event.data;
+        if (!msg || msg.source !== 'watch-party-player-bridge' || msg.kind !== 'event') return;
+        if (Number.isFinite(Number(msg.currentTime))) _bridgeCurrentTime = Number(msg.currentTime);
+        if (isRemoteAction) return;
+
+        if (msg.event === 'play' || msg.event === 'pause' || msg.event === 'seeked') {
+            socket.emit('sync_state', {
+                roomId: ROOM_ID,
+                action: msg.event,
+                time: _bridgeCurrentTime
+            });
+            socket.emit('user_status', {
+                roomId: ROOM_ID,
+                sender: USERNAME,
+                type: msg.event === 'seeked' ? 'seek' : msg.event,
+                timestamp: formatTime(_bridgeCurrentTime)
+            });
+        }
+        if (msg.event === 'buffering' && !isBuffering) {
+            isBuffering = true;
+            socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'buffer_start' });
+        }
+        if (msg.event === 'canplay' && isBuffering) {
+            isBuffering = false;
+            socket.emit('user_status', { roomId: ROOM_ID, sender: USERNAME, type: 'buffer_end' });
+        }
+    });
+
+    socket.off('sync_state');
+    socket.on('sync_state', (data) => {
+        isRemoteAction = true;
+        _bridgeCurrentTime = Number(data.time) || 0;
+        PLATFORM.postCmd(data.action === 'seeked' ? 'seek' : data.action, _bridgeCurrentTime);
+        if (data.message) showNotification(data.message);
+        setTimeout(() => { isRemoteAction = false; }, 900);
+    });
+
+    socket.on('latecomer_arrived', (data) => {
+        PLATFORM.postCmd('pause', _bridgeCurrentTime);
+        socket.emit('sync_state', {
+            roomId: ROOM_ID,
+            action: 'pause',
+            time: _bridgeCurrentTime,
+            message: `GUEST_${data.newUserId} DETECTED. SYNCING...`
+        });
+    });
+
+    showNotification('STREAMILOO SYNC ACTIVE');
 }
 
 // =====================================================
@@ -478,8 +577,18 @@ socket.on('user_status', (data) => {
     const { sender, type, timestamp } = data;
     const msgs = { play: `▶ ${sender} played at ${timestamp}`, pause: `⏸ ${sender} paused at ${timestamp}`, seek: `⏩ ${sender} skipped to ${timestamp}`, ad_start: `📺 ${sender} is watching an ad — room paused`, ad_end: `✅ ${sender}'s ad finished — resuming`, buffer_start: `⏳ ${sender} is buffering...`, buffer_end: `✅ ${sender} finished buffering` };
     if (msgs[type]) appendStatusMessage(msgs[type], type);
-    if (type === 'ad_start' && video && !isInAd) { isRemoteAction = true; video.pause(); setTimeout(() => { isRemoteAction = false; }, 800); }
-    if (type === 'ad_end'   && video)            { isRemoteAction = true; video.play().catch(() => {}); setTimeout(() => { isRemoteAction = false; }, 800); }
+    if (type === 'ad_start' && video && !isInAd) {
+        isRemoteAction = true;
+        if (PLATFORM.usesPlayerBridge) PLATFORM.postCmd('pause', _bridgeCurrentTime);
+        else video.pause();
+        setTimeout(() => { isRemoteAction = false; }, 800);
+    }
+    if (type === 'ad_end' && video) {
+        isRemoteAction = true;
+        if (PLATFORM.usesPlayerBridge) PLATFORM.postCmd('play', _bridgeCurrentTime);
+        else video.play().catch(() => {});
+        setTimeout(() => { isRemoteAction = false; }, 800);
+    }
 });
 
 // =====================================================
